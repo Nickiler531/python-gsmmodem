@@ -2,7 +2,7 @@
 
 """ High-level API classes for an attached GSM modem """
 
-import sys, re, logging, weakref, time, threading, abc, codecs
+import sys, re, logging, weakref, time, threading, abc, codecs, subprocess, zlib, json
 from datetime import datetime
 
 from .serial_comms import SerialComms
@@ -13,6 +13,7 @@ from .util import SimpleOffsetTzInfo, lineStartingWith, allLinesMatchingPattern,
 from . import compat # For Python 2.6 compatibility
 from gsmmodem.util import lineMatching
 from gsmmodem.exceptions import EncodingError
+
 PYTHON_VERSION = sys.version_info[0]
 if PYTHON_VERSION >= 3:
     xrange = range
@@ -129,12 +130,15 @@ class GsmModem(SerialComms):
     CUSD_REGEX = re.compile(r'\+CUSD:\s*(\d),"(.*?)",(\d+)', re.DOTALL)
     # Used for parsing SMS status reports
     CDSI_REGEX = re.compile(r'\+CDSI:\s*"([^"]+)",(\d+)$')
+    #used for pasring HTTP responses
+    HTTPACTION_REGEX = re.compile(r'^\+HTTPACTION:\s*(\d+),(\d+),(\d+)')
     
-    def __init__(self, port, baudrate=115200, incomingCallCallbackFunc=None, smsReceivedCallbackFunc=None, smsStatusReportCallback=None):
+    def __init__(self, port='/dev/ttyS1', baudrate=115200, incomingCallCallbackFunc=None, smsReceivedCallbackFunc=None, smsStatusReportCallback=None, gpsStatusReportCallbackFunc=None):
         super(GsmModem, self).__init__(port, baudrate, notifyCallbackFunc=self._handleModemNotification)
         self.incomingCallCallback = incomingCallCallbackFunc or self._placeholderCallback
         self.smsReceivedCallback = smsReceivedCallbackFunc or self._placeholderCallback
         self.smsStatusReportCallback = smsStatusReportCallback or self._placeholderCallback
+        self.gpsStatusReportCallback = gpsStatusReportCallbackFunc or self._placeholderCallback
         # Flag indicating whether caller ID for incoming call notification has been set up
         self._callingLineIdentification = False
         # Flag indicating whether incoming call notifications have extended information
@@ -160,8 +164,17 @@ class GsmModem(SerialComms):
         self._smsMemReadDelete = None # Preferred message storage memory for reads/deletes (<mem1> parameter used for +CPMS)
         self._smsMemWrite = None # Preferred message storage memory for writes (<mem2> parameter used for +CPMS)
         self._smsReadSupported = True # Whether or not reading SMS messages is supported via AT commands
+        self.gps = Gps(self)
+        self.gprs = Gprs(self)
+        #self.callback_commands = ['+CMTI','+CUSD','+CDSI','+UGNSINF:','+HTTPACTION']
+        self.callback_cmd_REGEX =[ re.compile("^(\+CMTI).*"),
+                                    re.compile("^(\+CUSD).*"),
+                                    re.compile("^(\+CDSI).*"),
+                                    re.compile("^(\+UGNSINF).*"),
+                                    re.compile("^(\+HTTPACTION).*")
+                                    ]
 
-    def connect(self, pin=None):
+    def connect(self, pin=None, initGps = True, setSystemDate = True):
         """ Opens the port and initializes the modem and SIM card
          
         :param pin: The SIM card PIN code, if any
@@ -170,8 +183,27 @@ class GsmModem(SerialComms):
         :raise PinRequiredError: if the SIM card requires a PIN but none was provided
         :raise IncorrectPinError: if the specified PIN is incorrect
         """
+
         self.log.info('Connecting to modem on port %s at %dbps', self.port, self.baudrate)        
         super(GsmModem, self).connect()
+
+        if setSystemDate:
+            sim808_time = self.write('AT+CCLK?')[1][6:]
+            if sim808_time[2:4] < 18: # The date is previos 2018
+                self.log.warning("RTC is outdated. System date was not updated")
+            else:
+                formatted_date = "{}-{}-{}T{}".format(sim808_time[2:4],sim808_time[5:7],sim808_time[8:10],sim808_time[11:19])
+                subprocess.call(["date","--set",formatted_date])
+                self.log.info("System date updated as RTC time {}".format(formatted_date))
+
+        try:
+            self.write('AT+CFUN=1,1')
+            time.sleep(10) #todo, has to wait for the SIM to confirm SMS ready and CPI ready
+        except CommandError as e:
+            self.log.error(e) #todo
+
+
+
         # Send some initialization commands to the modem
         try:        
             self.write('ATZ') # reset configuration
@@ -185,7 +217,10 @@ class GsmModem(SerialComms):
             self.write('ATZ') # reset configuration        
         else:
             pinCheckComplete = False
-        self.write('ATE0') # echo off
+
+        if initGps:
+            self.gps.start_acquisition()
+
         try:
             cfun = int(lineStartingWith('+CFUN:', self.write('AT+CFUN?'))[7:]) # example response: +CFUN: 1
             if cfun != 1:
@@ -235,18 +270,23 @@ class GsmModem(SerialComms):
                     self.write('AT+WIND=50')
                 callUpdateTableHint = 2 # Wavecom
 
-        # Attempt to identify modem type directly (if not already) - for outgoing call status updates
-        if callUpdateTableHint == 0:
-            if self.manufacturer.lower() == 'huawei':
-                callUpdateTableHint = 1 # huawei
-            else:
-                # See if this is a ZTE modem that has not yet been identified based on supported commands
-                try:
-                    self.write('AT+ZPAS?')
-                except CommandError:
-                    pass # Not a ZTE modem
-                else:
-                    callUpdateTableHint = 3 # ZTE
+        
+        
+        callUpdateTableHint = 4
+       
+
+        # # Attempt to identify modem type directly (if not already) - for outgoing call status updates
+        # if callUpdateTableHint == 0:
+        #     if self.manufacturer.lower() == 'huawei':
+        #         callUpdateTableHint = 1 # huawei
+        #     else:
+        #         # See if this is a ZTE modem that has not yet been identified based on supported commands
+        #         try:
+        #             self.write('AT+ZPAS?')
+        #         except CommandError:
+        #             pass # Not a ZTE modem
+        #         else:
+        #             callUpdateTableHint = 3 # ZTE
         # Load outgoing call status updates based on identified modem features
         if callUpdateTableHint == 1:
             # Use Hauwei's ^NOTIFICATIONs
@@ -279,6 +319,12 @@ class GsmModem(SerialComms):
             self._waitForCallInitUpdate = False # ZTE modems do not provide "call initiated" updates
             if commands == None: # ZTE uses standard +VTS for DTMF
                 Call.dtmfSupport = True
+        elif callUpdateTableHint == 4:
+            self.log.info('SIM808 detected')
+            Call.dtmfSupport = True
+            self._mustPollCallStatus = True
+            self._pollCallStatusRegex = re.compile('^\+CLCC:\s+(\d+),(\d),(\d),(\d),([^,]),"([^,]*)",(\d+)$')
+            self._waitForAtdResponse = True # Most modems return OK immediately after issuing ATD
         else:
             # Unknown modem - we do not know what its call updates look like. Use polling instead
             self.log.info('Unknown/generic modem type - will use polling for call state updates')
@@ -338,7 +384,7 @@ class GsmModem(SerialComms):
         
         if self._smsReadSupported:
             try:
-                self.write('AT+CNMI=2,1,0,2') # Set message notifications
+                self.write('AT+CNMI=2,1,0,0') # Set message notifications xxSIM808
             except CommandError:
                 # Message notifications not supported
                 self._smsReadSupported = False
@@ -362,7 +408,8 @@ class GsmModem(SerialComms):
 
         # Call control setup
         self.write('AT+CVHU=0', parseError=False) # Enable call hang-up with ATH command (ignore if command not supported)
-    
+
+
     def _unlockSim(self, pin):
         """ Unlocks the SIM card using the specified PIN (if necessary, else does nothing) """
         # Unlock the SIM card if needed
@@ -443,7 +490,18 @@ class GsmModem(SerialComms):
                         raise CommandError(data)
                 elif cmdStatusLine == 'COMMAND NOT SUPPORT': # Some Huawei modems respond with this for unknown commands
                     raise CommandError(data + '({0})'.format(cmdStatusLine))
-            return responseLines
+            #experimental. Some of the callback messages arrives just before a request have been done. Handle them in a right way
+            
+            new_responseLines = []
+            for line in responseLines:
+                good_line = True
+                for RGX_cmd in self.callback_cmd_REGEX:
+                    if RGX_cmd.search(line) != None:
+                        threading.Thread(target=self.__threadedHandleModemNotification, kwargs={'lines': responseLines}).start()
+                        good_line = False
+                if good_line:
+                    new_responseLines.append(line)
+            return new_responseLines
 
     @property
     def signalStrength(self):
@@ -454,12 +512,17 @@ class GsmModem(SerialComms):
         :return: The network signal strength as an integer between 0 and 99, or -1 if it is unknown
         :rtype: int
         """
-        csq = self.CSQ_REGEX.match(self.write('AT+CSQ')[0])
+        msg = self.write('AT+CSQ')
+        csq = self.CSQ_REGEX.match(msg[1])
         if csq:
             ss = int(csq.group(1))
             return ss if ss != 99 else -1
         else:
-            raise CommandError()
+            csq = self.CSQ_REGEX.match(msg[2]) #try in another part of the message. When unsolicited messages are received, this problems can happen
+            if csq:
+                ss = int(csq.group(1))
+                return ss if ss != 99 else -1
+            #raise CommandError()
 
     @property
     def manufacturer(self):
@@ -623,7 +686,7 @@ class GsmModem(SerialComms):
         else:
             # If this is reached, the timer task has triggered
             raise TimeoutException()
-        
+
     def sendSms(self, destination, text, waitForDeliveryReport=False, deliveryTimeout=15, sendFlash=False):
         """ Send an SMS text message
         
@@ -859,6 +922,8 @@ class GsmModem(SerialComms):
         
         :param lines The lines that were read
         """
+        match_found = False
+
         for line in lines:
             if 'RING' in line:
                 # Incoming call (or existing call is ringing)
@@ -867,7 +932,7 @@ class GsmModem(SerialComms):
             elif line.startswith('+CMTI'):
                 # New SMS message indication
                 self._handleSmsReceived(line)
-                return
+                match_found = True
             elif line.startswith('+CUSD'):
                 # USSD notification - either a response or a MT-USSD ("push USSD") message
                 self._handleUssd(lines)
@@ -875,7 +940,15 @@ class GsmModem(SerialComms):
             elif line.startswith('+CDSI'):
                 # SMS status report
                 self._handleSmsStatusReport(line)
-                return
+                match_found = True
+            elif line.startswith('+UGNSINF:'):
+                # GPS status report
+                self._handleGpsStatusReport(line)
+                match_found = True
+            elif line.startswith('+HTTPACTION'):
+                #HTTP response report
+                self._handleHttpReport(line) #todo
+                match_found = True
             else:
                 # Check for call status updates            
                 for updateRegex, handlerFunc in self._callStatusUpdates:
@@ -884,9 +957,23 @@ class GsmModem(SerialComms):
                         # Handle the update
                         handlerFunc(match)
                         return
-        # If this is reached, the notification wasn't handled
-        self.log.debug('Unhandled unsolicited modem notification: %s', lines)    
+        if not match_found: 
+            # If this is reached, the notification wasn't handled
+            self.log.debug('Unhandled unsolicited modem notification: %s', lines)    
     
+    def _handleGpsStatusReport(self,line):
+        self.log.debug('Handling incoming gps report')
+        self.gps.parse_location(line)
+        self.gpsStatusReportCallback(self.gps)
+
+    def _handleHttpReport(self,line):
+        httpMatch = self.HTTPACTION_REGEX.match(line)
+        if httpMatch:
+            self.gprs.httpaction_resp = {'method': int(httpMatch.group(1)),
+                                         'code':int(httpMatch.group(2)),
+                                         'dataLen': int(httpMatch.group(3))}
+            self.gprs.httpaction_callback = True
+
     def _handleIncomingCall(self, lines):
         self.log.debug('Handling incoming call')
         ringLine = lines.pop(0)
@@ -1281,7 +1368,6 @@ class Call(object):
         if self.id in self._gsmModem.activeCalls:
             del self._gsmModem.activeCalls[self.id]
 
-
 class IncomingCall(Call):
     
     CALL_TYPE_MAP = {'VOICE': 0}
@@ -1352,3 +1438,240 @@ class Ussd(object):
         """
         if self.sessionActive:
             self._gsmModem.write('AT+CUSD=2')
+
+class Gps(object):
+    """ GPS data obtained from the SIM808. This class contains the methods to parse the message and store them
+    """
+    def __init__(self, gsmModem):
+        self._gsmModem = weakref.proxy(gsmModem)
+        
+        self.firstTimeFixed = False
+        self.fixStatus = 0
+        self.timestamp = ""
+        self.colDate = ""
+        self.lat = 0
+        self.lng = 0
+        self.altitude = 0
+        self.speed = 0
+        self.course = 0
+        self.fixMode = 0
+        self.hdop = 0
+        self.satViewed = 0
+        self.satUsed = 0
+
+    def start_acquisition(self):
+        self._gsmModem.log.info("GPS started")
+        self._gsmModem.write('AT+CGNSPWR=1')
+        self._gsmModem.write('AT+CGNSURC=2')
+
+    def stop_acquisition(self):
+        self._gsmModem.log.info("GPS stopped")
+        self._gsmModem.write('AT+CGNSPWR=0')
+
+    def parse_location(self,GNSS):
+        try:
+            data = GNSS.split(':')[1].split(',')
+            self.fixStatus = int(data[1])
+            self.timestamp = datetime.strptime(data[2],"%Y%m%d%H%M%S.%f").isoformat()
+            self.lat = float(data[3] or 0)
+            self.lng = float(data[4] or 0)
+            self.altitude = float(data[5] or 0)
+            self.speed = float(data[6] or 0)
+            self.course = float(data[7] or 0)
+            self.fixMode = int(data[8] or 0)
+            self.hdop = float(data[10] or 0)
+            self.satViewed = int(data[14] or 0)
+            self.satUsed = int(data[15] or 0)
+
+        except Exception,e:
+            self._gsmModem.log.warning(e)
+
+        #The first time the system acquires GPS, update the clock of the SIM808
+        if (not self.firstTimeFixed) and (self.fixStatus == 1):
+            self.firstTimeFixed = True
+            date = self.timestamp
+            formatted_date = "{}/{}/{},{}+00".format(date[2:4],date[5:7],date[8:10],date[11:19])
+            self._gsmModem.write('AT+CCLK="{}"'.format(formatted_date))
+            subprocess.call(["date","--set",date])
+            self._gsmModem.log.info("GPS fixed. System date and RTC date updated to {}".format(self.timestamp))
+
+    def get_location(self):
+        location = {
+                    'timestamp': self.timestamp,
+                    'lat': self.lat,
+                    'lng': self.lng,
+                    'altitude': self.altitude,
+                    'speed': self.speed,
+                    #'course': float(data[7] or 0),
+                    'hdop': self.hdop,
+                    'fix': self.fixStatus,
+                    'fix_mode': self.fixMode,
+                    'visible_sat': self.satViewed,
+                    'used_sat': self.satUsed
+                }
+        return location
+
+class Gprs(object):
+    """ Class that contains the funcions for HTTP communication (as defines in the SIM808)
+    """
+    def __init__(self, gsmModem):
+        self._gsmModem = weakref.proxy(gsmModem)
+        self.apn = None
+        self.state = "Disconnected"
+        self.httpaction_resp = {'method': 0,
+                                'code':0,
+                                'dataLen':0}
+        self.httpaction_callback = False
+
+    def set_apn(self,apn):
+        self.apn = apn
+
+    def compress_data(self, data):
+        data_comp = zlib.compress(json.dumps(data)).encode('base64')
+        return json.dumps({'data':data_comp})
+
+    def decompress_data(self, data, compress):
+        if compress:
+            try:
+                temp = json.loads(data)
+                data_decomp = zlib.decompress(temp['data'].decode('base64'))
+                temp['data'] = data_decomp
+                data = json.dumps(temp)
+            except Exception as e:
+                self._gsmModem.log.warn("Error decompress_data: {}".format(e))
+            else:
+                return data
+        return data
+
+    def http_post(self,url,data,compress=True):
+        self._gsmModem.log.info("command POST, url: {}, compress:{}".format(url,compress))
+        response = {'status':'','code':'','data':''}
+
+        if compress:
+            url += "&compress="+str(compress).lower()
+            data = self.compress_data(data)
+        self._gsmModem.log.debug("len data: {}".format(len(data)))
+        
+        # commands = [ 
+        #       ['AT+SAPBR=2,1\n','OK'],
+        #       ['AT+HTTPINIT\n', 'OK'],
+        #       ['AT+HTTPPARA="CID",1\n', 'OK'],
+        #       ['AT+HTTPPARA="URL","%s"\n' % (url), 'OK'],
+        #       ['AT+HTTPPARA="CONTENT","application/json"\n', 'OK'],
+        #       ['AT+HTTPDATA=%d,10000\n' % len(data), 'DOWNLOAD'],
+        #       [data, 'OK'],
+        #       ['AT+HTTPACTION=1\n', '+HTTPACTION'],
+        #       ['AT+HTTPREAD\n', 'OK'],
+        #       ['AT+HTTPTERM\n', 'OK']
+        #     ]
+
+        try:
+            res = self._gsmModem.write('AT+SAPBR=2,1')
+
+            res = self._gsmModem.write('AT+HTTPINIT')
+
+            res = self._gsmModem.write('AT+HTTPPARA="CID",1')
+            
+            res = self._gsmModem.write('AT+HTTPPARA="URL","{}"'.format(url))
+
+            res = self._gsmModem.write('AT+HTTPPARA="CONTENT","application/json"')
+
+            res = self._gsmModem.write('AT+HTTPDATA={},10000'.format(len(data)))
+
+            res = self._gsmModem.write(data)
+
+            res = self._gsmModem.write('AT+HTTPACTION=1', '+HTTPACTION')
+
+            wait_done = False
+            while not wait_done:
+                if self.httpaction_callback == True:
+                    response['status'] = 'OK'
+                    response['code'] = self.httpaction_resp['code']
+                    wait_done = True
+                    self.httpaction_callback = False
+
+            res = self._gsmModem.write('AT+HTTPREAD')
+            
+            if len(res[1]) > 3:
+                response['data'] = res[2]
+                response['data'] = self.decompress_data(response['data'],compress)
+
+            res = self._gsmModem.write('AT+HTTPTERM')
+        except Exception as e:
+            self._gsmModem.log.error(e)
+            time.sleep(10)
+            res = self._gsmModem.write('AT+HTTPTERM')
+            response['status'] = 'ERROR'
+
+        # self.sem_acquire()
+
+        # for command in commands:
+        #     self.serial_com.write(bytes(command[0]))
+        #     logger.debug(command[0])
+        #     ret =  self.wait_response(command[1],timeout=40)
+        #     logger.debug(ret)
+
+        #     if ret['status'] == 'ERROR':
+        #         response['status'] = 'ERROR'
+        #         response['data'] = command[0]
+        #         time.sleep(15)
+        #         self.serial_com.write(bytes('AT+HTTPTERM\n'))
+        #         ret =  self.wait_response('OK')
+        #         logger.warn("error with command {}".format(command[0]))
+        #         raise ValueError('SIM808',response)
+            # if command[0] == 'AT+HTTPACTION=1\n':
+            #     ret['data'] = [a for a in ret['data'] if not a.startswith('+UGNSINF:')]
+            #     code = ret['data'][-1].split(':')[1].split(',')[1]
+            #     response['status'] = 'OK'
+            #     response['code'] = int(code)
+            # elif command[0] == 'AT+HTTPREAD\n':
+            #     ret['data'] = [a for a in ret['data'] if not a.startswith('+UGNSINF:')]
+            #     if len(ret['data']) > 3:
+            #         response['data'] = ret['data'][2]
+            #         response['data'] = self.decompress_data(response['data'],compress)
+
+        # self.sem_release()
+        return response
+
+
+
+    def get(self):
+        pass #todo
+
+    def start(self):
+
+        commands = [ 
+              'AT+CPIN?',
+              'AT+CREG=1',
+              'AT+CREG?',
+              'AT+CGATT?',
+              'AT+SAPBR=3,1,"CONTYPE","GPRS"',
+              'AT+SAPBR=3,1,"APN","{}"'.format(self.apn), 
+              'AT+SAPBR=1,1',
+              'AT+SAPBR=2,1'
+            ]
+
+        self._gsmModem.log.info('Starting GPRS')
+        status = "FAILED"
+        attempts = 0
+        
+        succesful_attempt = False
+
+        while attempts < 10 and not succesful_attempt:
+            attempts = attempts + 1
+            succesful_attempt = True
+            for command in commands:
+                res = self._gsmModem.write(command)
+                if (command == 'AT+CREG?') and not ('+CREG: 1,1' in res or '+CREG: 1,5' in res):
+                    succesful_attempt = False
+                    break
+                if "ERROR" in res:
+                    succesful_attempt = False
+                    break
+            if succesful_attempt: 
+                status = "OK"
+            else:
+                self._gsmModem.log.warn('Retrying to connect network. Attempt # {}'.format(attempts))
+                time.sleep(15) #todo check this time
+        return status, attempts 
+

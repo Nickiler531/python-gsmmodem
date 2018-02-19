@@ -14,9 +14,9 @@ from __future__ import print_function
 
 import sys, time, logging
 
-PORT = '/dev/ttyUSB2'
+PORT = '/dev/ttyS1'
 BAUDRATE = 115200
-NUMBER = '00000' # Number to dial - CHANGE THIS TO A REAL NUMBER
+NUMBER = '3003073164' # Number to dial - CHANGE THIS TO A REAL NUMBER
 PIN = None # SIM card PIN (if any)
 
 from gsmmodem.modem import GsmModem
