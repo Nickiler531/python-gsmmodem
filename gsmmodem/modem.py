@@ -110,7 +110,8 @@ class StatusReport(Sms):
 class GsmModem(SerialComms):
     """ Main class for interacting with an attached GSM modem """
     
-    log = logging.getLogger('gsmmodem.modem.GsmModem')
+    #log = logging.getLogger('gsmmodem.modem.GsmModem')
+    log = logging.getLogger()
 
     # Used for parsing AT command errors
     CM_ERROR_REGEX = re.compile(r'^\+(CM[ES]) ERROR: (\d+)$')
@@ -132,6 +133,10 @@ class GsmModem(SerialComms):
     CDSI_REGEX = re.compile(r'\+CDSI:\s*"([^"]+)",(\d+)$')
     #used for pasring HTTP responses
     HTTPACTION_REGEX = re.compile(r'^\+HTTPACTION:\s*(\d+),(\d+),(\d+)')
+    CREG_REGEX = re.compile(r'^\+CREG:\s*(\d+),(\d+)')
+    SAPBR_REGEX = re.compile(r'^\+SAPBR\s*(\d+):\s*DEACT')
+    SAPBR_IP_REGEX = re.compile(r'^\+SAPBR:\s*\d+,\d+,"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)"')
+    HTTPSTATUS_REGEX = re.compile(r'^\+HTTPSTATUS:\s*\w*,(\d*),(\d*),(\d*)')
     
     def __init__(self, port='/dev/ttyS1', baudrate=115200, incomingCallCallbackFunc=None, smsReceivedCallbackFunc=None, smsStatusReportCallback=None, gpsStatusReportCallbackFunc=None):
         super(GsmModem, self).__init__(port, baudrate, notifyCallbackFunc=self._handleModemNotification)
@@ -493,14 +498,18 @@ class GsmModem(SerialComms):
             #experimental. Some of the callback messages arrives just before a request have been done. Handle them in a right way
             
             new_responseLines = []
+            modified_response = False
             for line in responseLines:
                 good_line = True
                 for RGX_cmd in self.callback_cmd_REGEX:
                     if RGX_cmd.search(line) != None:
                         threading.Thread(target=self.__threadedHandleModemNotification, kwargs={'lines': responseLines}).start()
                         good_line = False
+                        modified_response = True
                 if good_line:
                     new_responseLines.append(line)
+            if modified_response:
+                self.log.debug("frame cleaned to: {}".format(new_responseLines)) 
             return new_responseLines
 
     @property
@@ -512,26 +521,62 @@ class GsmModem(SerialComms):
         :return: The network signal strength as an integer between 0 and 99, or -1 if it is unknown
         :rtype: int
         """
-        msg = self.write('AT+CSQ')
-        csq = self.CSQ_REGEX.match(msg[1])
+        if self.gprs.busy:
+            return None
+        csq = None
+        msj = ''
+        try:
+            msg = self.write('AT+CSQ')
+            csq = self.CSQ_REGEX.match(msg[1])
+        except:
+            pass
         if csq:
             ss = int(csq.group(1))
             return ss if ss != 99 else -1
-        else:
-            csq = self.CSQ_REGEX.match(msg[2]) #try in another part of the message. When unsolicited messages are received, this problems can happen
-            if csq:
-                ss = int(csq.group(1))
-                return ss if ss != 99 else -1
             #raise CommandError()
+
+    @property
+    def networkStatus(self):
+        """ Checks the network status and parse it into its meaning
+        """
+        if self.gprs.busy:
+            return None
+        
+        try:
+            status = self.write("AT+CREG?")[1]
+            cregMatch = self.CREG_REGEX.match(status)
+            msj = ''
+            if cregMatch:
+                data = int(cregMatch.group(2))
+                if data == 0:
+                    msj = 'Not registered, not searching'
+                elif data == 1:
+                    msj = 'Registered'
+                elif data == 2:
+                    msj = 'Not registered, but searching'
+                elif data == 3:
+                    msj = 'Registration denied'
+                elif data == 4:
+                    msj = 'Unknown'
+                elif data == 5:
+                    msj = 'Registered, roaming'
+                self.log.debug('Update network status {}'.format(msj))
+            return msj
+        except Exception,e:
+            self.log.error("update network(): {}".format(e))
 
     @property
     def manufacturer(self):
         """ :return: The modem's manufacturer's name """
+        if self.gprs.busy:
+            return None
         return self.write('AT+CGMI')[0]
     
     @property
     def model(self):
         """ :return: The modem's model name """
+        if self.gprs.busy:
+            return None
         return self.write('AT+CGMM')[0]
     
     @property
@@ -947,8 +992,13 @@ class GsmModem(SerialComms):
                 match_found = True
             elif line.startswith('+HTTPACTION'):
                 #HTTP response report
-                self._handleHttpReport(line) #todo
+                self._handleHttpReport(line)
                 match_found = True
+            elif line.startswith('+SAPBR'):
+                #SAPBR response (when the gprs connection is lost)
+                self._handleSAPBRReport(line)
+                match_found = True
+
             else:
                 # Check for call status updates            
                 for updateRegex, handlerFunc in self._callStatusUpdates:
@@ -973,6 +1023,10 @@ class GsmModem(SerialComms):
                                          'code':int(httpMatch.group(2)),
                                          'dataLen': int(httpMatch.group(3))}
             self.gprs.httpaction_callback = True
+
+    def _handleSAPBRReport(self,line): #todo
+        sapbrMatch = self.SAPBR_REGEX.match(line) #todo
+
 
     def _handleIncomingCall(self, lines):
         self.log.debug('Handling incoming call')
@@ -1514,6 +1568,8 @@ class Gps(object):
 class Gprs(object):
     """ Class that contains the funcions for HTTP communication (as defines in the SIM808)
     """
+    HTTP_CORRECT_CODES = [200,201]
+
     def __init__(self, gsmModem):
         self._gsmModem = weakref.proxy(gsmModem)
         self.apn = None
@@ -1522,6 +1578,7 @@ class Gprs(object):
                                 'code':0,
                                 'dataLen':0}
         self.httpaction_callback = False
+        self.busy = False
 
     def set_apn(self,apn):
         self.apn = apn
@@ -1543,6 +1600,19 @@ class Gprs(object):
                 return data
         return data
 
+    @property
+    def ip(self):
+        try:
+            if self.busy:
+                return None
+            msg = self.write('AT+SAPBR=2,1')
+            match = self.SAPBR_IP_REGEX.match(msg[1])
+            if match:
+                return match.group(1) 
+        except:
+            return None
+
+
     def http_post(self,url,data,compress=True):
         self._gsmModem.log.info("command POST, url: {}, compress:{}".format(url,compress))
         response = {'status':'','code':'','data':''}
@@ -1551,127 +1621,225 @@ class Gprs(object):
             url += "&compress="+str(compress).lower()
             data = self.compress_data(data)
         self._gsmModem.log.debug("len data: {}".format(len(data)))
+
         
-        # commands = [ 
-        #       ['AT+SAPBR=2,1\n','OK'],
-        #       ['AT+HTTPINIT\n', 'OK'],
-        #       ['AT+HTTPPARA="CID",1\n', 'OK'],
-        #       ['AT+HTTPPARA="URL","%s"\n' % (url), 'OK'],
-        #       ['AT+HTTPPARA="CONTENT","application/json"\n', 'OK'],
-        #       ['AT+HTTPDATA=%d,10000\n' % len(data), 'DOWNLOAD'],
-        #       [data, 'OK'],
-        #       ['AT+HTTPACTION=1\n', '+HTTPACTION'],
-        #       ['AT+HTTPREAD\n', 'OK'],
-        #       ['AT+HTTPTERM\n', 'OK']
-        #     ]
-
         try:
-            res = self._gsmModem.write('AT+SAPBR=2,1')
-
-            res = self._gsmModem.write('AT+HTTPINIT')
-
-            res = self._gsmModem.write('AT+HTTPPARA="CID",1')
-            
-            res = self._gsmModem.write('AT+HTTPPARA="URL","{}"'.format(url))
-
-            res = self._gsmModem.write('AT+HTTPPARA="CONTENT","application/json"')
-
-            res = self._gsmModem.write('AT+HTTPDATA={},10000'.format(len(data)))
-
-            res = self._gsmModem.write(data)
-
-            res = self._gsmModem.write('AT+HTTPACTION=1', '+HTTPACTION')
-
-            wait_done = False
-            while not wait_done:
-                if self.httpaction_callback == True:
-                    response['status'] = 'OK'
-                    response['code'] = self.httpaction_resp['code']
-                    wait_done = True
-                    self.httpaction_callback = False
-
-            res = self._gsmModem.write('AT+HTTPREAD')
-            
-            if len(res[1]) > 3:
-                response['data'] = res[2]
-                response['data'] = self.decompress_data(response['data'],compress)
-
-            res = self._gsmModem.write('AT+HTTPTERM')
+            self._gsmModem.write('AT+HTTPINIT')
         except Exception as e:
             self._gsmModem.log.error(e)
-            time.sleep(10)
+
+        try:
+            self._gsmModem.write('AT+HTTPPARA="CID",1')
+        except Exception as e:
+            self._gsmModem.log.error(e)
+            
+        try:
+            self._gsmModem.write('AT+HTTPPARA="URL","{}"'.format(url))
+        except Exception as e:
+            self._gsmModem.log.error(e)
+
+        try:
+            self._gsmModem.write('AT+HTTPPARA="CONTENT","application/json"')
+        except Exception as e:
+            self._gsmModem.log.error(e)
+
+        try:
+            self._gsmModem.write('AT+HTTPDATA={},1500'.format(len(data)))
+        except Exception as e:
+            self._gsmModem.log.error(e)
+
+        try:
+            self._gsmModem.write(data)
+        except Exception as e:
+            self._gsmModem.log.error(e)
+           
+        
+        try:
+            #check if http is free to send/receive
+            res = self._gsmModem.write('AT+HTTPSTATUS?')[1]
+            match = self._gsmModem.HTTPSTATUS_REGEX.match(res)
+            if match and int(match.group(1)) == 0:            
+                res = self._gsmModem.write('AT+HTTPACTION=1', '+HTTPACTION')
+
+            wait_done = False
+            while not wait_done: #todo There is no timeout. A possible source of errors.
+                if self.httpaction_callback == True:
+                    self.httpaction_callback = False #unset the callback
+                    response['code'] = self.httpaction_resp['code']
+                    if not int(self.httpaction_resp['code'] in self.HTTP_CORRECT_CODES): #Todo: refine error habdling depending on the code
+                        self._gsmModem.log.warn("HTTP response not valid. code = {}".format(self.httpaction_resp['code']))
+                        response['status'] = 'UNSUCCESFULL'
+                    else:
+                        response['status'] = 'OK'
+                    wait_done = True
+        except Exception as e: 
+            self._gsmModem.log.error(e)
+        
+        try:
+            if response['status'] == 'OK':
+                res = self._gsmModem.write('AT+HTTPREAD')
+                if len(res[1]) > 3:
+                    response['data'] = res[2]
+                    response['data'] = self.decompress_data(response['data'],compress)
             res = self._gsmModem.write('AT+HTTPTERM')
-            response['status'] = 'ERROR'
+        
+        except Exception as e: 
+            self._gsmModem.log.error(e)
+            try:
+                self._gsmModem.write('AT+HTTPTERM')
+            except:
+                self._gsmModem.log.error(e)
 
-        # self.sem_acquire()
+        # except Exception as e:
+        #     self._gsmModem.log.error(e)
+        #     time.sleep(10)
 
-        # for command in commands:
-        #     self.serial_com.write(bytes(command[0]))
-        #     logger.debug(command[0])
-        #     ret =  self.wait_response(command[1],timeout=40)
-        #     logger.debug(ret)
+        #     try:
+        #         res = self._gsmModem.write('AT+HTTPTERM')
+        #     except Exception as e:
+        #         self._gsmModem.log.error(e)
+        #     self._gsmModem.log.info("Restarting GPRS")
+        #     self.reset()
+        #     time.sleep(5)
+        #     response['status'] = 'ERROR'
 
-        #     if ret['status'] == 'ERROR':
-        #         response['status'] = 'ERROR'
-        #         response['data'] = command[0]
-        #         time.sleep(15)
-        #         self.serial_com.write(bytes('AT+HTTPTERM\n'))
-        #         ret =  self.wait_response('OK')
-        #         logger.warn("error with command {}".format(command[0]))
-        #         raise ValueError('SIM808',response)
-            # if command[0] == 'AT+HTTPACTION=1\n':
-            #     ret['data'] = [a for a in ret['data'] if not a.startswith('+UGNSINF:')]
-            #     code = ret['data'][-1].split(':')[1].split(',')[1]
-            #     response['status'] = 'OK'
-            #     response['code'] = int(code)
-            # elif command[0] == 'AT+HTTPREAD\n':
-            #     ret['data'] = [a for a in ret['data'] if not a.startswith('+UGNSINF:')]
-            #     if len(ret['data']) > 3:
-            #         response['data'] = ret['data'][2]
-            #         response['data'] = self.decompress_data(response['data'],compress)
-
-        # self.sem_release()
         return response
 
 
+    def _wait_response(self):
+        """ This function sends various AT commands to see if the terminal responds. It doesn't respond when a long command like COPS or SAPBR is processing info.
+        """
+        time.sleep(5)
+        terminal_free = False
+        while terminal_free == False: 
+            try:
+                self._gsmModem.write('AT',timeout=0.5)
+                terminal_free = True
+            except:
+                time.sleep(5)
 
-    def get(self):
+    def http_get(self):
         pass #todo
 
     def start(self):
 
-        commands = [ 
-              'AT+CPIN?',
-              'AT+CREG=1',
-              'AT+CREG?',
-              'AT+CGATT?',
-              'AT+SAPBR=3,1,"CONTYPE","GPRS"',
-              'AT+SAPBR=3,1,"APN","{}"'.format(self.apn), 
-              'AT+SAPBR=1,1',
-              'AT+SAPBR=2,1'
-            ]
-
-        self._gsmModem.log.info('Starting GPRS')
-        status = "FAILED"
-        attempts = 0
+        self._gsmModem.log.info('Starting GPRS...')
         
-        succesful_attempt = False
+        #Stage 1: Test if SimCard and module are fine
+        self._gsmModem.log.info('Checking Sim808 and simcard integrity...')
+        try: 
+            self._gsmModem.write('AT+CPIN?') #Check Sim
+            self._gsmModem.write('AT+CREG=1') #Activate network
+        except Exception as e:
+            raise Exception('{}'.format(e))
 
-        while attempts < 10 and not succesful_attempt:
-            attempts = attempts + 1
-            succesful_attempt = True
-            for command in commands:
-                res = self._gsmModem.write(command)
-                if (command == 'AT+CREG?') and not ('+CREG: 1,1' in res or '+CREG: 1,5' in res):
-                    succesful_attempt = False
-                    break
-                if "ERROR" in res:
-                    succesful_attempt = False
-                    break
-            if succesful_attempt: 
-                status = "OK"
-            else:
-                self._gsmModem.log.warn('Retrying to connect network. Attempt # {}'.format(attempts))
-                time.sleep(15) #todo check this time
-        return status, attempts 
+        time.sleep(5) #Sleep 5 seconds while the network connects
 
+        #Stage 2. Wait the network status. if "1,0", the network is dead and has to be resetted. Otherwhise, keep waiting
+        self._gsmModem.log.info('Checking network connection...')
+        network_connected = False
+        
+        while network_connected == False:
+            try:
+                status = self._gsmModem.write('AT+CREG?')[1] #Check network status
+                
+                cregMatch = self._gsmModem.CREG_REGEX.match(status)
+                if cregMatch:
+                    data = int(cregMatch.group(2))
+                    if data == 0: #network failed. Resetting network
+                        self._gsmModem.log.warn('Network dead, retrying connection')
+                        self._reset_network()
+                    elif data == 1 or data == 5:
+                        network_connected = True
+                        self._gsmModem.log.info('Conection succesfull!!')
+                    else:
+                        self._gsmModem.log.info('Still Connecting...')
+                        time.sleep(10)
+                else:
+                    time.sleep(10)
+            except CmeError as e:
+                self._gsmModem.log.warn('Network not available. {}'.format(e))
+            except Exception as e:
+                self._gsmModem.log.error('gprs start. Stage 2 failed: {}'.format(e))
+
+        #Stage 3. GPRS configuration
+        try:
+            self._gsmModem.write('AT+SAPBR=3,1,"CONTYPE","GPRS"')
+            self._gsmModem.write('AT+SAPBR=3,1,"APN","{}"'.format(self.apn))
+        except Exception as e:
+            self._gsmModem.log.error('gprs start. Stage 3 failed: {}'.format(e))
+
+        #Stage 4. IP acquiring
+        try:
+            res = self._gsmModem.write('AT+SAPBR=1,1',waitForResponse=False) #Maximun timeout defined in datasheet is 85sec
+            self._wait_response()
+            res = self._gsmModem.write('AT+SAPBR=2,1') 
+        except CmeError as e:
+            self._gsmModem.log.error('gprs start. Stage 4 failed: {}'.format(e))
+
+        return "OK",1
+
+    
+    def _reset_network(self):
+        """ This function is used when the CREG status is 1,1. It reloads the network and take care of the long timeouts of the messages.
+        """
+        try:
+            self.busy = True
+            res = self._gsmModem.write('AT+COPS=2',waitForResponse=False)
+            self._wait_response()
+            res = self._gsmModem.write('AT+COPS=0',waitForResponse=False)
+            self._wait_response()
+            self.busy = False
+            time.sleep(5)
+        except Exception as e:
+            self._gsmModem.log.error('_resetting network failed: {}'.format(e))
+
+    def reset(self):
+
+        self._gsmModem.log.info('Resetting GPRS...')
+        
+        self._gsmModem.log.info('Checking network connection...')
+        
+        network_connected = False
+        
+        self._reset_network()
+
+        while network_connected == False:
+            try:
+                status = self._gsmModem.write('AT+CREG?')[1] #Check network status
+                
+                cregMatch = self._gsmModem.CREG_REGEX.match(status)
+                if cregMatch:
+                    data = int(cregMatch.group(2))
+                    if data == 0: #network failed. Resetting network
+                        self._gsmModem.log.warn('Network dead, retrying connection')
+                        self._reset_network()
+                    elif data == 1 or data == 5:
+                        network_connected = True
+                        self._gsmModem.log.info('Conection succesfull!!')
+                    else:
+                        self._gsmModem.log.info('Still Connecting...')
+                        time.sleep(10)
+                else:
+                    time.sleep(10)
+            except CmeError as e:
+                self._gsmModem.log.warn('Network not available. {}'.format(e))
+            except Exception as e:
+                self._gsmModem.log.error('gprs start. Stage 2 failed: {}'.format(e))
+
+        try:
+            self.busy = True
+            self._gsmModem.write('AT+SAPBR=1,1',waitForResponse=False) #Maximun timeout defined in datasheet is 85sec
+            self._wait_response()
+            self.busy = False
+            self._gsmModem.write('AT+SAPBR=2,1') 
+        except Exception as e:
+            self._gsmModem.log.error('resetting network failed: {}'.format(e))
+
+    def check_network_status(self):
+        self._gsmModem.log.debug("Checking network status")
+        print(self.ip)
+        if self.ip == "0.0.0.0":
+            self.reset()
+        elif self._gsmModem.networkStatus == 'Not registered, not searching':
+            self.reset()
