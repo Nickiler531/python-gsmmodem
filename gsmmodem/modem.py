@@ -192,6 +192,24 @@ class GsmModem(SerialComms):
         self.log.info('Connecting to modem on port %s at %dbps', self.port, self.baudrate)        
         super(GsmModem, self).connect()
 
+        time.sleep(5)
+        terminal_free = False
+        while terminal_free == False: 
+            try:
+                self.write('AT',timeout=0.5)
+                terminal_free = True
+            except:
+                time.sleep(5)
+
+        time.sleep(5)
+        terminal_free = False
+        while terminal_free == False: 
+            try:
+                self.write('AT',timeout=0.5)
+                terminal_free = True
+            except:
+                time.sleep(5)
+
         if setSystemDate:
             sim808_time = self.write('AT+CCLK?')[1][6:]
             if sim808_time[2:4] < 18: # The date is previos 2018
@@ -1672,6 +1690,7 @@ class Gprs(object):
                     else:
                         response['status'] = 'OK'
                     wait_done = True
+                time.sleep(0.2)
         except Exception as e: 
             self._gsmModem.log.error(e)
         
