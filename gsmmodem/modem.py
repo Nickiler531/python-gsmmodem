@@ -1778,8 +1778,10 @@ class Gprs(object):
                     time.sleep(10)
             except CmeError as e:
                 self._gsmModem.log.warn('Network not available. {}'.format(e))
+                time.sleep(5)
             except Exception as e:
                 self._gsmModem.log.error('gprs start. Stage 2 failed: {}'.format(e))
+                time.sleep(5)
 
         #Stage 3. GPRS configuration
         try:
@@ -1843,8 +1845,10 @@ class Gprs(object):
                     time.sleep(10)
             except CmeError as e:
                 self._gsmModem.log.warn('Network not available. {}'.format(e))
+                delay(5)
             except Exception as e:
                 self._gsmModem.log.error('gprs start. Stage 2 failed: {}'.format(e))
+                delay(5)
 
         try:
             self.busy = True
