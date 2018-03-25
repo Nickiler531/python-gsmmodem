@@ -4,6 +4,7 @@
 
 import sys, re, logging, weakref, time, threading, abc, codecs, subprocess, zlib, json
 from datetime import datetime
+import os
 
 from .serial_comms import SerialComms
 from .exceptions import CommandError, InvalidStateException, CmeError, CmsError, InterruptedException, TimeoutException, PinRequiredError, IncorrectPinError, SmscNumberUnknownError
@@ -194,12 +195,23 @@ class GsmModem(SerialComms):
 
         time.sleep(5)
         terminal_free = False
+        retry_times = 0
         while terminal_free == False: 
             try:
                 self.write('AT',timeout=0.5)
                 terminal_free = True
             except:
+                retry_times = retry_times + 1
                 time.sleep(5)
+            if retry_times > 3:
+                try:
+                    self.log.warning("Sim808 restarting. Normal if is the first time it turns on the system. not normal otherwhise")
+                    os.system("sh /opt/Agrum/concentrador/services/turn_on_sim808.sh")
+                    time.sleep(5)
+                    retry_times = 0
+                except Exception as e:
+                    self.log.error("Turn Sim808 failed with error: {}".format(e))
+                    time.sleep(1)
 
         time.sleep(5)
         terminal_free = False
